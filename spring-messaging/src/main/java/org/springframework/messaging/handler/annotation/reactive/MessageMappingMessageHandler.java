@@ -83,15 +83,12 @@ import org.springframework.validation.Validator;
 public class MessageMappingMessageHandler extends AbstractMethodMessageHandler<CompositeMessageCondition>
 		implements EmbeddedValueResolverAware {
 
-	@Nullable
-	private Predicate<Class<?>> handlerPredicate =
-			beanType -> AnnotatedElementUtils.hasAnnotation(beanType, Controller.class);
-
 	private final List<Decoder<?>> decoders = new ArrayList<>();
 
 	@Nullable
 	private Validator validator;
 
+	@Nullable
 	private RouteMatcher routeMatcher;
 
 	private ConversionService conversionService = new DefaultFormattingConversionService();
@@ -101,66 +98,15 @@ public class MessageMappingMessageHandler extends AbstractMethodMessageHandler<C
 
 
 	public MessageMappingMessageHandler() {
-		AntPathMatcher pathMatcher = new AntPathMatcher();
-		pathMatcher.setPathSeparator(".");
-		this.routeMatcher = new SimpleRouteMatcher(pathMatcher);
+		setHandlerPredicate(type -> AnnotatedElementUtils.hasAnnotation(type, Controller.class));
 	}
 
-
-	/**
-	 * Manually configure handlers to check for {@code @MessageMapping} methods.
-	 * <p><strong>Note:</strong> the given handlers are not required to be
-	 * annotated with {@code @Controller}. Consider also using
-	 * {@link #setAutoDetectDisabled()} if the intent is to use these handlers
-	 * instead of, and not in addition to {@code @Controller} classes. Or
-	 * alternatively use {@link #setHandlerPredicate(Predicate)} to select a
-	 * different set of beans based on a different criteria.
-	 * @param handlers the handlers to register
-	 * @see #setAutoDetectDisabled()
-	 * @see #setHandlerPredicate(Predicate)
-	 */
-	public void setHandlers(List<Object> handlers) {
-		for (Object handler : handlers) {
-			detectHandlerMethods(handler);
-		}
-		// Disable auto-detection..
-		this.handlerPredicate = null;
-	}
-
-	/**
-	 * Configure the predicate to use for selecting which Spring beans to check
-	 * for {@code @MessageMapping} methods. When set to {@code null},
-	 * auto-detection is turned off which is what
-	 * {@link #setAutoDetectDisabled()} does internally.
-	 * <p>The predicate used by default selects {@code @Controller} classes.
-	 * @see #setHandlers(List)
-	 * @see #setAutoDetectDisabled()
-	 */
-	public void setHandlerPredicate(@Nullable Predicate<Class<?>> handlerPredicate) {
-		this.handlerPredicate = handlerPredicate;
-	}
-
-	/**
-	 * Return the {@link #setHandlerPredicate configured} handler predicate.
-	 */
-	@Nullable
-	public Predicate<Class<?>> getHandlerPredicate() {
-		return this.handlerPredicate;
-	}
-
-	/**
-	 * Disable auto-detection of {@code @MessageMapping} methods, e.g. in
-	 * {@code @Controller}s, by setting {@link #setHandlerPredicate(Predicate)
-	 * setHandlerPredicate(null)}.
-	 */
-	public void setAutoDetectDisabled() {
-		this.handlerPredicate = null;
-	}
 
 	/**
 	 * Configure the decoders to use for incoming payloads.
 	 */
 	public void setDecoders(List<? extends Decoder<?>> decoders) {
+		this.decoders.clear();
 		this.decoders.addAll(decoders);
 	}
 
@@ -203,7 +149,9 @@ public class MessageMappingMessageHandler extends AbstractMethodMessageHandler<C
 
 	/**
 	 * Return the {@code RouteMatcher} used to map messages to handlers.
+	 * May be {@code null} before component is initialized.
 	 */
+	@Nullable
 	public RouteMatcher getRouteMatcher() {
 		return this.routeMatcher;
 	}
@@ -232,6 +180,19 @@ public class MessageMappingMessageHandler extends AbstractMethodMessageHandler<C
 
 
 	@Override
+	public void afterPropertiesSet() {
+
+		// Initialize RouteMatcher before parent initializes handler mappings
+		if (this.routeMatcher == null) {
+			AntPathMatcher pathMatcher = new AntPathMatcher();
+			pathMatcher.setPathSeparator(".");
+			this.routeMatcher = new SimpleRouteMatcher(pathMatcher);
+		}
+
+		super.afterPropertiesSet();
+	}
+
+	@Override
 	protected List<? extends HandlerMethodArgumentResolver> initArgumentResolvers() {
 		List<HandlerMethodArgumentResolver> resolvers = new ArrayList<>();
 
@@ -254,7 +215,7 @@ public class MessageMappingMessageHandler extends AbstractMethodMessageHandler<C
 
 		// Catch-all
 		resolvers.add(new PayloadMethodArgumentResolver(
-				this.decoders, this.validator, getReactiveAdapterRegistry(), true));
+				getDecoders(), this.validator, getReactiveAdapterRegistry(), true));
 
 		return resolvers;
 	}
@@ -262,11 +223,6 @@ public class MessageMappingMessageHandler extends AbstractMethodMessageHandler<C
 	@Override
 	protected List<? extends HandlerMethodReturnValueHandler> initReturnValueHandlers() {
 		return Collections.emptyList();
-	}
-
-	@Override
-	protected Predicate<Class<?>> initHandlerPredicate() {
-		return this.handlerPredicate;
 	}
 
 
@@ -282,20 +238,34 @@ public class MessageMappingMessageHandler extends AbstractMethodMessageHandler<C
 		return methodCondition;
 	}
 
+	/**
+	 * Determine the mapping condition for the given annotated element.
+	 * @param element the element to check
+	 * @return the condition, or {@code null}
+	 */
 	@Nullable
-	private CompositeMessageCondition getCondition(AnnotatedElement element) {
+	protected CompositeMessageCondition getCondition(AnnotatedElement element) {
 		MessageMapping annot = AnnotatedElementUtils.findMergedAnnotation(element, MessageMapping.class);
 		if (annot == null || annot.value().length == 0) {
 			return null;
 		}
-		String[] destinations = annot.value();
+		String[] patterns = processDestinations(annot.value());
+		return new CompositeMessageCondition(
+				new DestinationPatternsMessageCondition(patterns, this.routeMatcher));
+	}
+
+	/**
+	 * Resolve placeholders in the given destinations.
+	 * @param destinations the destinations
+	 * @return new array with the processed destinations or the same array
+	 */
+	protected String[] processDestinations(String[] destinations) {
 		if (this.valueResolver != null) {
-			destinations = Arrays.stream(annot.value())
+			destinations = Arrays.stream(destinations)
 					.map(s -> this.valueResolver.resolveStringValue(s))
 					.toArray(String[]::new);
 		}
-		return new CompositeMessageCondition(
-				new DestinationPatternsMessageCondition(destinations, this.routeMatcher));
+		return destinations;
 	}
 
 	@Override
